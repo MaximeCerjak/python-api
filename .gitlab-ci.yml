@@ -1,70 +1,207 @@
 image: docker:25.0.3
-services: ["docker:25.0.3-dind"]
+
 variables:
+  DOCKER_TLS_CERTDIR: "/certs"
   DOCKER_DRIVER: overlay2
-  TAG: "$CI_COMMIT_SHORT_SHA"
 
-stages: [test, build, push, deploy]
+services:
+  - docker:25.0.3-dind
 
-pytest:
-  stage: test
+default:
+  interruptible: true
+
+stages:
+  - SecurityCheck
+  - Quality
+  - Build
+  - Deployment
+
+# -----------------------------
+# 🔐 SECURITY CHECK
+# -----------------------------
+security-check:
+  stage: SecurityCheck
+  image: python:3.12-slim
+  before_script:
+    - pip install safety
+  script:
+    - safety check --full-report
+  allow_failure: false
+
+# -----------------------------
+# 🧹 LINTING & TEST
+# -----------------------------
+lint-and-test:
+  stage: Quality
   image: python:3.12-slim
   before_script:
     - pip install -r requirements.txt
+    - pip install flake8 pytest
   script:
+    - flake8 app --count --max-line-length=100 --statistics
     - pytest -q
+  allow_failure: false
+  dependencies:
+    - security-check
+  only:
+    - develop
+    - main
+    - /^prod-.*/
 
-build:
-  stage: build
+# -----------------------------
+# 🏗️ BUILD IMAGES (RECETTE)
+# -----------------------------
+image_fastapi_recette:
+  stage: Build
+  image: docker:25.0.3
+  environment:
+    name: recette
   before_script:
-    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - echo "${REGISTRY_USER_PASSWORD}" | docker login ${REGISTRY_URL} --username ${REGISTRY_USER_LOGIN} --password-stdin
+  variables:
+    TAG_PACKAGE_FASTAPI: "${REGISTRY_URL}/${CI_PROJECT_TITLE}/fastapi_backend:${CI_COMMIT_SHORT_SHA}"
   script:
-    - docker build -t "$CI_REGISTRY_IMAGE:$TAG" -t "$CI_REGISTRY_IMAGE:latest" --build-arg BUILD_TARGET=prod .
+    # Construction de l'image backend Python
+    - docker build -q -t ${TAG_PACKAGE_FASTAPI} --build-arg BUILD_TARGET=recette . > build.log 2>&1 || (echo "❌ Build failed :" >&2 && tail -n 100 build.log >&2 && exit 1)
+    - docker push ${TAG_PACKAGE_FASTAPI}
+  allow_failure: false
+  only:
+    - develop
 
-push:
-  stage: push
-  script:
-    - docker push "$CI_REGISTRY_IMAGE:$TAG"
-    - docker push "$CI_REGISTRY_IMAGE:latest"
-  needs: [build]
-
-.deploy_template: &deploy
-  stage: deploy
-  image: alpine:3.20
+# -----------------------------
+# 🏗️ BUILD IMAGES (PRODUCTION)
+# -----------------------------
+image_fastapi_production:
+  stage: Build
+  image: docker:25.0.3
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^prod-.*/
+  environment:
+    name: production
   before_script:
-    - apk add --no-cache openssh-client rsync curl
-    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
-    - echo "$SSH_PRIVATE_KEY" | tr -d '
-' > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
-    - ssh -o StrictHostKeyChecking=no "$DEPLOY_USER@$DEPLOY_HOST" 'echo ok'
+    - echo "${REGISTRY_USER_PASSWORD}" | docker login ${REGISTRY_URL} --username ${REGISTRY_USER_LOGIN} --password-stdin
+  variables:
+    TAG_PACKAGE_FASTAPI: "${REGISTRY_URL}/${CI_PROJECT_TITLE}/fastapi_backend:${CI_COMMIT_SHORT_SHA}"
   script:
-    - |
-      ssh "$DEPLOY_USER@$DEPLOY_HOST" <<'EOF'
-      set -e
-      export CI_REGISTRY_IMAGE="$CI_REGISTRY_IMAGE"
-      export TAG="$TAG"
-      export RELEASE_DIR="$DEPLOY_PATH"
-      mkdir -p "$RELEASE_DIR"
-      cd "$RELEASE_DIR"
-      # Place les compose d'env si besoin (une seule fois)
-      mkdir -p infra/compose infra/env || true
-      # Pull & restart
-      docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-      TAG="$TAG" CI_REGISTRY_IMAGE="$CI_REGISTRY_IMAGE" docker compose -f infra/compose/docker-compose.${ENV_TARGET}.yml pull
-      TAG="$TAG" CI_REGISTRY_IMAGE="$CI_REGISTRY_IMAGE" docker compose -f infra/compose/docker-compose.${ENV_TARGET}.yml up -d
-      docker system prune -f
-      EOF
+    - docker build -q -t ${TAG_PACKAGE_FASTAPI} --build-arg BUILD_TARGET=prod . > build.log 2>&1 || (echo "❌ Build failed :" >&2 && tail -n 100 build.log >&2 && exit 1)
+    - docker push ${TAG_PACKAGE_FASTAPI}
+  allow_failure: false
 
-recette-deploy:
-  <<: *deploy
+# -----------------------------
+# 🚀 DEPLOIEMENT RECETTE
+# -----------------------------
+recette:
+  stage: Deployment
+  image: docker:25.0.3
+  environment:
+    name: recette
   variables:
-    ENV_TARGET: "recette"
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "develop"'
+    PROJECT_RELEASE_ROOT_DIR: "/home/webnet/"
+    PROJECT_ARCHIVE_DIR: "/home/webnet/archive"
+  before_script:
+    - echo "${REGISTRY_USER_PASSWORD}" | docker login ${REGISTRY_URL} --username ${REGISTRY_USER_LOGIN} --password-stdin
+    # Configuration SSH
+    - 'which ssh-agent || ( apt-get update && apt-get install -y openssh-client )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SSH_PRIVATE_KEY")
+    - mkdir -p ~/.ssh
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+  script:
+    # Création dynamique du docker-compose-prod.yml
+    - cp infra/compose/docker-compose.prod.yml.dist docker-compose-prod.yml
+    # Injection du nom d’image
+    - sed -i -e "s#\\[IMAGE_FASTAPI_NAME\\]#${REGISTRY_URL}/${CI_PROJECT_TITLE}/fastapi_backend:${CI_COMMIT_SHORT_SHA}#g" docker-compose-prod.yml
 
-prod-deploy:
-  <<: *deploy
-  variables:
-    ENV_TARGET: "prod"
+    # Suppression du fichier docker-compose sur le serveur de recette
+    - ssh webnet@192.168.220.37 "rm -f ${PROJECT_RELEASE_ROOT_DIR}/docker-compose.yml && exit"
+
+    # Copie du nouveau fichier sur le serveur
+    - scp ${CI_PROJECT_DIR}/docker-compose-prod.yml webnet@192.168.220.37:${PROJECT_RELEASE_ROOT_DIR}/docker-compose.yml
+    - scp ${CI_PROJECT_DIR}/docker-compose-prod.yml webnet@192.168.220.37:${PROJECT_ARCHIVE_DIR}/docker-compose-${CI_JOB_STARTED_AT}.yml
+
+    # Création du fichier .env distant injecté depuis GitLab
+    - ssh webnet@192.168.220.37 "cat > ${PROJECT_RELEASE_ROOT_DIR}/.env <<EOV
+      APP_NAME=${APP_NAME}
+      ENV=recette
+      LOG_LEVEL=${LOG_LEVEL}
+      JWT_SECRET=${JWT_SECRET}
+      API_TOKEN=${API_TOKEN}
+      ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      EOV"
+
+    # Pull & restart des containers
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.220.37 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose pull && exit"
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.220.37 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose down -v && exit"
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.220.37 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose up -d && docker image prune -a -f && exit"
+  allow_failure: false
+  only:
+    - develop
+  dependencies:
+    - image_fastapi_recette
+
+# -----------------------------
+# 🚀 DEPLOIEMENT PRODUCTION
+# -----------------------------
+production:
+  stage: Deployment
+  image: docker:25.0.3
   rules:
-    - if: '$CI_COMMIT_TAG =~ /^prod-.*/'
+    - if: $CI_COMMIT_TAG =~ /^prod-.*/
+  environment:
+    name: production
+  variables:
+    PROJECT_RELEASE_ROOT_DIR: "/home/webnet/"
+    PROJECT_ARCHIVE_DIR: "/home/webnet/archive"
+  before_script:
+    - echo "${REGISTRY_USER_PASSWORD}" | docker login ${REGISTRY_URL} --username ${REGISTRY_USER_LOGIN} --password-stdin
+    - 'which ssh-agent || ( apt-get update && apt-get install -y openssh-client )'
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SSH_PRIVATE_KEY")
+    - mkdir -p ~/.ssh
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+  script:
+    # Initialisation du fichier docker-compose-prod.yml
+    - cp infra/compose/docker-compose.prod.yml.dist docker-compose-prod.yml
+    - sed -i -e "s#\\[IMAGE_FASTAPI_NAME\\]#${REGISTRY_URL}/${CI_PROJECT_TITLE}/fastapi_backend:${CI_COMMIT_SHORT_SHA}#g" docker-compose-prod.yml
+
+    # Suppression du fichier docker-compose sur les serveurs prod et DMZ
+    - ssh webnet@192.168.220.40 "rm -f ${PROJECT_RELEASE_ROOT_DIR}/docker-compose.yml && exit"
+    - ssh webnet@192.168.9.12 "rm -f ${PROJECT_RELEASE_ROOT_DIR}/docker-compose.yml && exit"
+
+    # Copie du docker-compose sur les deux serveurs
+    - scp ${CI_PROJECT_DIR}/docker-compose-prod.yml webnet@192.168.220.40:${PROJECT_RELEASE_ROOT_DIR}/docker-compose.yml
+    - scp ${CI_PROJECT_DIR}/docker-compose-prod.yml webnet@192.168.9.12:${PROJECT_RELEASE_ROOT_DIR}/docker-compose.yml
+    - scp ${CI_PROJECT_DIR}/docker-compose-prod.yml webnet@192.168.220.40:${PROJECT_ARCHIVE_DIR}/docker-compose-${CI_JOB_STARTED_AT}.yml
+    - scp ${CI_PROJECT_DIR}/docker-compose-prod.yml webnet@192.168.9.12:${PROJECT_ARCHIVE_DIR}/docker-compose-${CI_JOB_STARTED_AT}.yml
+
+    # Création du .env distant injecté depuis GitLab
+    - ssh webnet@192.168.220.40 "cat > ${PROJECT_RELEASE_ROOT_DIR}/.env <<EOV
+      APP_NAME=${APP_NAME}
+      ENV=prod
+      LOG_LEVEL=${LOG_LEVEL}
+      JWT_SECRET=${JWT_SECRET}
+      API_TOKEN=${API_TOKEN}
+      ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      EOV"
+
+          - ssh webnet@192.168.9.12 "cat > ${PROJECT_RELEASE_ROOT_DIR}/.env <<EOV
+      APP_NAME=${APP_NAME}
+      ENV=prod
+      LOG_LEVEL=${LOG_LEVEL}
+      JWT_SECRET=${JWT_SECRET}
+      API_TOKEN=${API_TOKEN}
+      ALLOWED_ORIGINS=${ALLOWED_ORIGINS}
+      EOV"
+
+    # Récupération des nouvelles images et redémarrage
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.220.40 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose pull && exit"
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.9.12 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose pull && exit"
+
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.220.40 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose down -v && exit"
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.220.40 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose up -d && docker image prune -a -f && exit"
+
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.9.12 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose down -v && exit"
+    - echo "${RECETTE_WEBNET_PASSWORD}" | ssh webnet@192.168.9.12 "cd ${PROJECT_RELEASE_ROOT_DIR} && docker compose up -d && docker image prune -a -f && exit"
+  allow_failure: false
+  dependencies:
+    - image_fastapi_production
