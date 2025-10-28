@@ -96,8 +96,8 @@ recette:
   environment:
     name: recette
   variables:
-    PROJECT_RELEASE_ROOT_DIR: "/home/webnet/"
-    PROJECT_ARCHIVE_DIR: "/home/webnet/archive"
+    PROJECT_RELEASE_ROOT_DIR: "/home/webnet/python-backend/"
+    PROJECT_ARCHIVE_DIR: "/home/webnet/python-backend/archive"
   before_script:
     - echo "${REGISTRY_USER_PASSWORD}" | docker login ${REGISTRY_URL} --username ${REGISTRY_USER_LOGIN} --password-stdin
     # Configuration SSH
@@ -150,8 +150,8 @@ production:
   environment:
     name: production
   variables:
-    PROJECT_RELEASE_ROOT_DIR: "/home/webnet/"
-    PROJECT_ARCHIVE_DIR: "/home/webnet/archive"
+    PROJECT_RELEASE_ROOT_DIR: "/home/webnet/python-backend/"
+    PROJECT_ARCHIVE_DIR: "/home/webnet/python-backend/archive"
   before_script:
     - echo "${REGISTRY_USER_PASSWORD}" | docker login ${REGISTRY_URL} --username ${REGISTRY_USER_LOGIN} --password-stdin
     - 'which ssh-agent || ( apt-get update && apt-get install -y openssh-client )'

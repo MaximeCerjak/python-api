@@ -1,9 +1,11 @@
 services:
-  api:
-    image: ${CI_REGISTRY_IMAGE}:${TAG:-recette}
-    container_name: py_api_recette
-    env_file: ../env/.env.recette
-    ports: ["8010:8000"]
+  fastapi:
+    image: [IMAGE_FASTAPI_NAME]
+    container_name: python-backend
+    env_file:
+      - .env
+    ports:
+      - "8010:8000"
     restart: always
 
   nginx:
@@ -24,5 +26,3 @@ services:
         driver: default
         config:
           - subnet: "172.20.0.0/24"
-
-  
