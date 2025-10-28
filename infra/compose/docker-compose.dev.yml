@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        BUILD_TARGET: dev
+    container_name: py_api_dev
+    env_file: ../env/.env.dev
+    ports: ["8000:8000"]
+    volumes:
+      - ../../app:/app/app:cached
+    restart: unless-stopped

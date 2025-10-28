@@ -1,0 +1,13 @@
+services:
+  api:
+    image: ${CI_REGISTRY_IMAGE}:${TAG:-latest}
+    container_name: py_api_prod
+    env_file: ../env/.env.prod
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: always

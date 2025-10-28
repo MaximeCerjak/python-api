@@ -1,0 +1,7 @@
+services:
+  api:
+    image: ${CI_REGISTRY_IMAGE}:${TAG:-recette}
+    container_name: py_api_recette
+    env_file: ../env/.env.recette
+    ports: ["8000:8000"]
+    restart: always
